@@ -1,0 +1,20 @@
+[project]
+name = "cs2-edge"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "beautifulsoup4>=4.15.0",
+    "duckdb>=1.5.5",
+    "httpx>=0.28.1",
+    "lightgbm>=4.7.0",
+    "polars>=1.44.2",
+]
+
+[project.scripts]
+cs2-edge = "cs2_edge:main"
+
+[build-system]
+requires = ["uv_build>=0.12.15,<0.13.0"]
+build-backend = "uv_build"

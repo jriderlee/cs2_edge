@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# UV / virtualenv
+.venv/
+
+# DuckDB local data
+data/
+
+# Environment
+.env
+
+# OS
+.DS_Store

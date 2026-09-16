@@ -10,7 +10,8 @@ dependencies = [
     "hltv-async-api>=0.8.3",
     "httpx>=0.28.1",
     "lightgbm>=4.7.0",
-    "polars>=1.44.2",
+    "matplotlib>=3.11.2",
+    "polars[rtcompat]>=1.44.2",
     "pyarrow>=25.0.1",
 ]
 

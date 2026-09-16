@@ -34,6 +34,13 @@ CONTRACT_SCHEMA = {
     "resolution_date": pl.Date,
 }
 
+CANDLE_SCHEMA = {
+    "contract_id": pl.Utf8,
+    "end_period_ts": pl.Int64,
+    "price": pl.Float64,
+    "volume": pl.Float64,
+}
+
 # normalized Kalshi name -> normalized HLTV name (Kalshi tends to shorten / rebrand)
 ALIASES = {
     "nip": "ninjasinpyjamas",
@@ -96,6 +103,19 @@ def _first_open(candles: list[dict]) -> float | None:
         if v is not None:
             return float(v)
     return None
+
+
+def _candle_close(c: dict) -> float | None:
+    p = c.get("price") or {}
+    v = p.get("close_dollars") if "close_dollars" in p else p.get("close")
+    return float(v) if v is not None else None
+
+
+def _candle_volume(c: dict) -> float | None:
+    v = c.get("volume_fp")
+    if v is None:
+        v = c.get("volume")
+    return float(v) if v not in (None, "") else None
 
 
 def _to_unix(ts: str | None) -> int | None:
@@ -194,22 +214,40 @@ class KalshiCollector:
             return []
         return data.get("candlesticks", [])
 
-    async def _fetch_open_prices(self, client: httpx.AsyncClient, markets: list[dict]) -> dict[str, float | None]:
+    async def _fetch_open_prices(
+        self, client: httpx.AsyncClient, markets: list[dict]
+    ) -> tuple[dict[str, float | None], list[dict]]:
         sem = asyncio.Semaphore(self.concurrency)
 
-        async def one(m: dict) -> tuple[str, float | None]:
+        async def one(m: dict) -> tuple[str, float | None, list[dict]]:
             async with sem:
-                return m["ticker"], _first_open(await self._candles(client, m))
+                candles = await self._candles(client, m)
+                return m["ticker"], _first_open(candles), candles
 
         results = await asyncio.gather(*(one(m) for m in markets))
-        return dict(results)
+        opens = {t: o for t, o, _ in results}
+        candle_rows = [
+            {
+                "contract_id": t,
+                "end_period_ts": c.get("end_period_ts"),
+                "price": _candle_close(c),
+                "volume": _candle_volume(c),
+            }
+            for t, _, candles in results
+            for c in candles
+            if c.get("end_period_ts") is not None
+        ]
+        return opens, candle_rows
 
     def _migrate(self, con: duckdb.DuckDBPyConnection) -> None:
-        cols = {r[0] for r in con.execute("DESCRIBE kalshi_contracts").fetchall()}
-        if "open_price" in cols:
-            return
-        con.execute("DROP TABLE IF EXISTS kalshi_contracts")
-        con.execute(SCHEMA_PATH.read_text())
+        contract_cols = {r[0] for r in con.execute("DESCRIBE kalshi_contracts").fetchall()}
+        if "open_price" not in contract_cols:
+            con.execute("DROP TABLE IF EXISTS kalshi_contracts")
+            con.execute(SCHEMA_PATH.read_text())
+        candle_cols = {r[0] for r in con.execute("DESCRIBE kalshi_candles").fetchall()}
+        if "volume" not in candle_cols:
+            con.execute("DROP TABLE IF EXISTS kalshi_candles")
+            con.execute(SCHEMA_PATH.read_text())
 
     def _insert(self, con: duckdb.DuckDBPyConnection, rows: list[dict]) -> int:
         if not rows:
@@ -226,6 +264,14 @@ class KalshiCollector:
             "resolved = EXCLUDED.resolved, "
             "resolution_date = EXCLUDED.resolution_date"
         )
+        return df.height
+
+    def _insert_candles(self, con: duckdb.DuckDBPyConnection, rows: list[dict]) -> int:
+        if not rows:
+            return 0
+        df = pl.DataFrame(rows, schema=CANDLE_SCHEMA)
+        con.register("_cdf", df)
+        con.execute("INSERT OR REPLACE INTO kalshi_candles BY NAME SELECT * FROM _cdf")
         return df.height
 
     async def collect(
@@ -245,9 +291,10 @@ class KalshiCollector:
                 markets = markets[:limit]
 
             opens: dict[str, float | None] = {}
+            candle_rows: list[dict] = []
             if fetch_open:
                 print("Fetching opening prices...")
-                opens = await self._fetch_open_prices(client, markets)
+                opens, candle_rows = await self._fetch_open_prices(client, markets)
 
         con = init_db(self.db_path)
         self._migrate(con)
@@ -291,11 +338,12 @@ class KalshiCollector:
                 )
 
         n = self._insert(con, rows)
+        n_candles = self._insert_candles(con, candle_rows)
         total = len(events)
         rate = (matched / total * 100) if total else 0.0
         print(
             f"Matched {matched}/{total} Kalshi matches to HLTV ({rate:.1f}%); "
-            f"unmatched: {unmatched}; contracts stored: {n}"
+            f"unmatched: {unmatched}; contracts stored: {n}; candles stored: {n_candles}"
         )
         con.close()
         return {"contracts": n, "matches": total, "matched": matched, "unmatched": unmatched}

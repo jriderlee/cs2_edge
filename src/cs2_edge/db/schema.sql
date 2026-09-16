@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS match_results (
     best_of         INTEGER,
     map_count       INTEGER,
     hltv_url        VARCHAR,
+    tier            VARCHAR,
     ingested_at     TIMESTAMPTZ DEFAULT now()
 );
 
@@ -41,6 +42,14 @@ CREATE TABLE IF NOT EXISTS kalshi_contracts (
     resolution_date DATE
 );
 
+CREATE TABLE IF NOT EXISTS kalshi_candles (
+    contract_id     VARCHAR,
+    end_period_ts   BIGINT,
+    price           DOUBLE,
+    volume          DOUBLE,
+    PRIMARY KEY (contract_id, end_period_ts)
+);
+
 CREATE TABLE IF NOT EXISTS roster_changes (
     change_id       BIGINT PRIMARY KEY,
     player_id       BIGINT,
@@ -57,4 +66,5 @@ CREATE INDEX IF NOT EXISTS idx_match_results_date ON match_results(match_date);
 CREATE INDEX IF NOT EXISTS idx_player_ratings_team ON player_ratings(team, rating_date);
 CREATE INDEX IF NOT EXISTS idx_player_ratings_match ON player_ratings(match_id);
 CREATE INDEX IF NOT EXISTS idx_kalshi_contracts_match ON kalshi_contracts(match_id);
+CREATE INDEX IF NOT EXISTS idx_kalshi_candles_contract ON kalshi_candles(contract_id);
 CREATE INDEX IF NOT EXISTS idx_roster_changes_player ON roster_changes(player_id, change_date);

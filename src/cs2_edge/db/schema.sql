@@ -62,6 +62,18 @@ CREATE TABLE IF NOT EXISTS roster_changes (
     ingested_at     TIMESTAMPTZ DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS live_alerts (
+    contract_id     VARCHAR PRIMARY KEY,
+    team            VARCHAR,
+    open_price      DOUBLE,
+    model_prob      DOUBLE,
+    divergence      DOUBLE,
+    tier            VARCHAR,
+    event_ticker    VARCHAR,
+    match_date      DATE,
+    alerted_at      TIMESTAMPTZ DEFAULT now()
+);
+
 CREATE INDEX IF NOT EXISTS idx_match_results_date ON match_results(match_date);
 CREATE INDEX IF NOT EXISTS idx_player_ratings_team ON player_ratings(team, rating_date);
 CREATE INDEX IF NOT EXISTS idx_player_ratings_match ON player_ratings(match_id);

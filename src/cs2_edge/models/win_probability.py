@@ -143,7 +143,25 @@ def compute_features(
             rating_hist[b].append((d, rb_cur))
         h2h_hist[frozenset((a, b))].append((d, winner))
 
-    return pl.DataFrame(rows)
+    return pl.DataFrame(
+        rows,
+        schema={
+            "match_id": pl.Int64,
+            "match_date": pl.Date,
+            "team_a": pl.Utf8,
+            "team_b": pl.Utf8,
+            "tier": pl.Utf8,
+            "bo": pl.Utf8,
+            "y": pl.Int64,
+            "wr30_diff": pl.Float64,
+            "wr60_diff": pl.Float64,
+            "wr90_diff": pl.Float64,
+            "rating30_diff": pl.Float64,
+            "h2h_diff": pl.Float64,
+            "h2h_count": pl.Int64,
+            "roster_diff": pl.Float64,
+        },
+    )
 
 
 def _log_loss(y: np.ndarray, p: np.ndarray) -> float:
@@ -243,6 +261,78 @@ def walk_forward_predict(
     return pl.concat(frames) if frames else df[:0]
 
 
+def build_state(
+    matches: pl.DataFrame, team_rating: dict, roster: dict[str, list[date]]
+) -> tuple[dict, dict, dict]:
+    """Roll past matches into per-team / per-pair histories for live feature lookup."""
+    win_hist: dict[str, deque] = defaultdict(deque)
+    rating_hist: dict[str, deque] = defaultdict(deque)
+    h2h_hist: dict[frozenset, deque] = defaultdict(deque)
+    for m in matches.iter_rows(named=True):
+        d, a, b, winner = m["match_date"], m["team_a"], m["team_b"], m["winner"]
+        a_won = winner == a
+        win_hist[a].append((d, a_won))
+        win_hist[b].append((d, not a_won))
+        ra = team_rating.get((m["match_id"], a))
+        rb = team_rating.get((m["match_id"], b))
+        if ra is not None:
+            rating_hist[a].append((d, ra))
+        if rb is not None:
+            rating_hist[b].append((d, rb))
+        h2h_hist[frozenset((a, b))].append((d, winner))
+    return win_hist, rating_hist, h2h_hist
+
+
+def feature_vector(
+    a: str,
+    b: str,
+    d: date,
+    bo: str,
+    tier: str,
+    state: tuple[dict, dict, dict],
+    roster: dict[str, list[date]],
+    feats: list[str],
+) -> list[float | None]:
+    """Compute the model's feature vector for a (team_a, team_b, date) from past data."""
+    win_hist, rating_hist, h2h_hist = state
+    fa, ra = _team_features(win_hist[a], rating_hist[a], d)
+    fb, rb = _team_features(win_hist[b], rating_hist[b], d)
+    aw, bw = _h2h(h2h_hist[frozenset((a, b))], d, a, b)
+    dsa = _days_since_change(roster.get(a, []), d)
+    dsb = _days_since_change(roster.get(b, []), d)
+    vals = {
+        "wr30_diff": fa[30] - fb[30],
+        "wr60_diff": fa[60] - fb[60],
+        "wr90_diff": fa[90] - fb[90],
+        "rating30_diff": (ra - rb) if (ra is not None and rb is not None) else None,
+        "h2h_diff": aw - bw,
+        "h2h_count": aw + bw,
+        "roster_diff": (dsa - dsb) if (dsa is not None and dsb is not None) else None,
+        "bo_BO3": 1 if bo == "BO3" else 0,
+        "bo_BO5": 1 if bo == "BO5" else 0,
+        "tier_T2": 1 if tier == "T2" else 0,
+        "tier_T3": 1 if tier == "T3" else 0,
+    }
+    return [vals.get(f) for f in feats]
+
+
+def train_model(df: pl.DataFrame, feats: list[str], rounds: int = 150):
+    """Train a LightGBM model on all available data (early stop on a trailing holdout)."""
+    df = df.sort("match_date")
+    n = df.height
+    tr, va = df[: int(n * 0.85)], df[int(n * 0.85) :]
+    model = lgb.train(
+        {"objective": "binary", "verbosity": -1, "seed": 0},
+        lgb.Dataset(tr.select(feats).to_numpy().astype(np.float32), label=tr["y"].to_numpy()),
+        num_boost_round=rounds,
+        valid_sets=[
+            lgb.Dataset(va.select(feats).to_numpy().astype(np.float32), label=va["y"].to_numpy())
+        ],
+        callbacks=[lgb.early_stopping(30), lgb.log_evaluation(0)],
+    )
+    return model
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="HLTV-only win probability model")
     parser.add_argument("--db", default=str(DEFAULT_DB_PATH), help="Path to DuckDB file")
@@ -278,8 +368,8 @@ def main() -> None:
         ).fetchall()
     }
     roster: dict[str, list[date]] = defaultdict(list)
-    for _, _, _, from_team, to_team, change_date, _, _ in con.execute(
-        "SELECT * FROM roster_changes"
+    for from_team, to_team, change_date in con.execute(
+        "SELECT from_team, to_team, change_date FROM roster_changes"
     ).fetchall():
         if from_team:
             roster[from_team].append(change_date)

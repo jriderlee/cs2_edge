@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -17,6 +18,7 @@ from cs2_edge.db.db_init import DEFAULT_DB_PATH, init_db
 
 BASE_URL = "https://www.hltv.org"
 RESULTS_URL = f"{BASE_URL}/results"
+TRANSFERS_URL = f"{BASE_URL}/transfers"
 
 MATCH_SCHEMA = {
     "match_id": pl.Int64,
@@ -40,8 +42,19 @@ RATING_SCHEMA = {
     "rating": pl.Float64,
     "maps_played": pl.Int32,
 }
+ROSTER_SCHEMA = {
+    "change_id": pl.Int64,
+    "player_id": pl.Int64,
+    "player_name": pl.Utf8,
+    "from_team": pl.Utf8,
+    "to_team": pl.Utf8,
+    "change_date": pl.Date,
+    "change_type": pl.Utf8,
+    "source_url": pl.Utf8,
+}
 MATCH_KEY_COLS = ["match_id", "match_date", "team_a", "team_b", "winner", "best_of", "map_count"]
 RATING_KEY_COLS = ["player_id", "match_id", "player_name", "team", "rating_date", "rating", "maps_played"]
+ROSTER_KEY_COLS = ["change_id"]
 
 
 def parse_hltv_date(text: str | None) -> date | None:
@@ -157,6 +170,66 @@ def parse_match_stats(page: BeautifulSoup) -> list[dict]:
     return rows
 
 
+def _change_id(player_id: int, change_date: date, ctype: str, from_team: str | None, to_team: str | None) -> int:
+    key = f"{player_id}|{change_date}|{ctype}|{from_team or ''}|{to_team or ''}"
+    return int(hashlib.md5(key.encode()).hexdigest()[:15], 16)
+
+
+def parse_transfers(page: BeautifulSoup) -> list[dict]:
+    rows: list[dict] = []
+    for r in page.select(".transfer-row"):
+        pimg = r.select_one("a.transfer-player-image-container")
+        player_id = player_name = None
+        if pimg:
+            m = re.search(r"/player/(\d+)/([^/]+)", pimg.get("href") or "")
+            if m:
+                player_id, player_name = int(m.group(1)), m.group(2)
+
+        def team_name(c) -> str | None:
+            if c.name != "a" or not (c.get("href") or "").startswith("/team/"):
+                return None
+            img = c.select_one("img")
+            if img:
+                return img.get("alt") or img.get("title")
+            m = re.search(r"/team/\d+/(.+)", c["href"])
+            return m.group(1) if m else None
+
+        teams = r.select(".transfer-team-container")
+        from_team = team_name(teams[0]) if teams else None
+        to_team = team_name(teams[1]) if len(teams) > 1 else None
+
+        mov = r.select_one(".transfer-movement")
+        mov_text = mov.get_text(" ", strip=True).lower() if mov else ""
+        if "is benched" in mov_text:
+            ctype = "bench"
+        elif "joins" in mov_text:
+            ctype = "join"
+        elif "parts ways" in mov_text:
+            ctype = "leave"
+        elif "transfers" in mov_text:
+            ctype = "transfer"
+        else:
+            ctype = "other"
+
+        d = r.select_one(".transfer-date")
+        change_date = parse_hltv_date(d.get_text(strip=True)) if d else None
+        if player_id is None or change_date is None:
+            continue
+        rows.append(
+            {
+                "change_id": _change_id(player_id, change_date, ctype, from_team, to_team),
+                "player_id": player_id,
+                "player_name": player_name,
+                "from_team": from_team,
+                "to_team": to_team,
+                "change_date": change_date,
+                "change_type": ctype,
+                "source_url": TRANSFERS_URL,
+            }
+        )
+    return rows
+
+
 class HLTVCollector:
     def __init__(
         self,
@@ -256,6 +329,32 @@ class HLTVCollector:
 
         return {"matches": total_matches, "ratings": total_ratings}
 
+    async def collect_roster(self, pages: int = 90) -> int:
+        self.hltv = Hltv(min_delay=0.5, max_delay=1.0, timeout=self.timeout, max_retries=self.max_retries)
+        con = init_db(self.db_path)
+        existing = {r[0] for r in con.execute("SELECT change_id FROM roster_changes").fetchall()}
+        rows: list[dict] = []
+        try:
+            for pg in range(1, pages + 1):
+                page = await self.hltv._fetch(f"{TRANSFERS_URL}?page={pg}")
+                if page is None:
+                    print(f"transfers page {pg} fetch failed; stopping")
+                    break
+                parsed = parse_transfers(page)
+                if not parsed:
+                    break
+                rows.extend(r for r in parsed if r["change_id"] not in existing)
+                if pg % 10 == 0:
+                    print(f"transfers page {pg}: {len(rows)} new so far")
+                await asyncio.sleep(0.5)
+        finally:
+            await self.hltv.close()
+
+        n = self._insert(con, "roster_changes", rows, ROSTER_SCHEMA, ROSTER_KEY_COLS)
+        con.close()
+        print(f"roster changes inserted: {n}")
+        return n
+
 
 async def _run(args: argparse.Namespace) -> None:
     collector = HLTVCollector(
@@ -263,6 +362,12 @@ async def _run(args: argparse.Namespace) -> None:
     )
     result = await collector.collect(years=args.years, max_matches=args.limit)
     print(f"Done: {result['matches']} matches, {result['ratings']} player ratings")
+
+
+async def _run_roster(args: argparse.Namespace) -> None:
+    collector = HLTVCollector(db_path=args.db, timeout=args.timeout, max_retries=args.retries)
+    n = await collector.collect_roster(pages=args.pages)
+    print(f"Done: {n} roster changes")
 
 
 def main() -> None:
@@ -273,11 +378,17 @@ def main() -> None:
     parser.add_argument("--timeout", type=float, default=15.0, help="Request timeout")
     parser.add_argument("--retries", type=int, default=10, help="Max retries per request")
     parser.add_argument("--limit", type=int, default=None, help="Max matches to collect (testing)")
+    parser.add_argument("--roster", action="store_true", help="Scrape roster changes (transfers)")
+    parser.add_argument("--pages", type=int, default=90, help="Transfers pages to scrape (~1 year)")
     parser.add_argument("--selftest", action="store_true", help="Run parser self-check and exit")
     args = parser.parse_args()
 
     if args.selftest:
         _selftest()
+        return
+
+    if args.roster:
+        asyncio.run(_run_roster(args))
         return
 
     asyncio.run(_run(args))
@@ -328,6 +439,29 @@ def _selftest() -> None:
     assert ratings[0]["team"] == "Nemiga"
     assert ratings[0]["rating"] == 1.26
     assert ratings[1]["team"] == "BET-M" and ratings[1]["rating"] == 0.95
+
+    transfers_html = """
+    <div class="transfer-row">
+      <a class="transfer-player-image-container" href="/player/25111/redzed"><img title="x"/></a>
+      <div class="transfer-teams-container">
+        <a class="transfer-team-container a-reset" href="/team/12366/aurora-young-blud">
+          <div class="transfer-team-logo-container"><img alt="Aurora Young Blud"/></div>
+        </a>
+        <div class="transfer-arrow"></div>
+        <a class="transfer-team-container a-reset" href="/team/13613/bebop">
+          <div class="transfer-team-logo-container"><img alt="Bebop"/></div>
+        </a>
+      </div>
+      <div class="transfer-movement">redzed transfers from Aurora Young Blud to Bebop</div>
+      <div class="transfer-date">Sep 17th 2026</div>
+    </div>
+    """
+    transfers = parse_transfers(BeautifulSoup(transfers_html, "html.parser"))
+    assert len(transfers) == 1, transfers
+    t = transfers[0]
+    assert t["player_id"] == 25111 and t["player_name"] == "redzed", t
+    assert t["from_team"] == "Aurora Young Blud" and t["to_team"] == "Bebop", t
+    assert t["change_type"] == "transfer" and t["change_date"] == date(2026, 9, 17), t
 
     print("selftest OK")
 

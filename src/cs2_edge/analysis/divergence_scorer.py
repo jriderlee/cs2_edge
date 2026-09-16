@@ -16,7 +16,7 @@ from cs2_edge.collectors.kalshi import normalize_team
 from cs2_edge.db.db_init import DEFAULT_DB_PATH, init_db
 
 FLAG_MIN_PRICE = 0.90  # 90-100% bin
-FLAG_MIN_DIVERGENCE = 0.10
+FLAG_MIN_DIVERGENCE = 0.30  # confirmed edge concentrates here (backtest)
 
 
 def score(contracts: pl.DataFrame, predictions: pl.DataFrame) -> pl.DataFrame:

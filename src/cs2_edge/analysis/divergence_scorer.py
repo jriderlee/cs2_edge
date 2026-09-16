@@ -59,7 +59,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Market-vs-model divergence scorer")
     parser.add_argument("--db", default=str(DEFAULT_DB_PATH), help="Path to DuckDB file")
     parser.add_argument(
-        "--pred", default="data/win_prob_predictions.csv", help="Model predictions CSV"
+        "--pred", default="data/win_prob_predictions_all.csv", help="Model predictions CSV"
     )
     parser.add_argument("--out", default=None, help="CSV path for flagged contracts")
     parser.add_argument("--selftest", action="store_true", help="Run self-check and exit")

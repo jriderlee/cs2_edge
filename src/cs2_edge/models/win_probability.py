@@ -206,11 +206,56 @@ def _fit_predict(df: pl.DataFrame, feats: list[str], rounds: int = 150) -> tuple
     return model, X_te, y_te, test
 
 
+def _next_month(d: date) -> date:
+    return d.replace(year=d.year + 1, month=1, day=1) if d.month == 12 else d.replace(month=d.month + 1, day=1)
+
+
+def walk_forward_predict(
+    df: pl.DataFrame, feats: list[str], start: date, rounds: int = 150
+) -> pl.DataFrame:
+    """Expanding-window walk-forward: train on all prior data, predict each month."""
+    df = df.sort("match_date")
+    frames: list[pl.DataFrame] = []
+    cur = start
+    last = df["match_date"].max()
+    while cur <= last:
+        nxt = _next_month(cur)
+        train = df.filter(pl.col("match_date") < cur)
+        window = df.filter((pl.col("match_date") >= cur) & (pl.col("match_date") < nxt))
+        if window.height:
+            n = train.height
+            tr, va = train[: int(n * 0.85)], train[int(n * 0.85) :]
+            model = lgb.train(
+                {"objective": "binary", "verbosity": -1, "seed": 0},
+                lgb.Dataset(tr.select(feats).to_numpy().astype(np.float32), label=tr["y"].to_numpy()),
+                num_boost_round=rounds,
+                valid_sets=[
+                    lgb.Dataset(va.select(feats).to_numpy().astype(np.float32), label=va["y"].to_numpy())
+                ],
+                callbacks=[lgb.early_stopping(30), lgb.log_evaluation(0)],
+            )
+            p = model.predict(
+                window.select(feats).to_numpy().astype(np.float32),
+                num_iteration=model.best_iteration,
+            )
+            frames.append(window.with_columns(prob_team_a=pl.Series("prob_team_a", p)))
+        cur = nxt
+    return pl.concat(frames) if frames else df[:0]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="HLTV-only win probability model")
     parser.add_argument("--db", default=str(DEFAULT_DB_PATH), help="Path to DuckDB file")
     parser.add_argument("--rounds", type=int, default=150, help="LightGBM boosting rounds")
-    parser.add_argument("--out", default=None, help="CSV path for test-set predictions")
+    parser.add_argument("--out", default=None, help="CSV path for predictions")
+    parser.add_argument(
+        "--predict-all",
+        action="store_true",
+        help="Walk-forward predictions for all matches from --start (defaults to all-pred CSV)",
+    )
+    parser.add_argument(
+        "--start", default="2025-11-01", help="Walk-forward start month (YYYY-MM-DD)"
+    )
     parser.add_argument("--selftest", action="store_true", help="Run self-check and exit")
     args = parser.parse_args()
 
@@ -251,6 +296,16 @@ def main() -> None:
     assert not any("price" in f or "kalshi" in f or "open" in f or "close" in f for f in feats), feats
     print(f"features ({len(feats)}): {feats}")
     print("ablation: no Kalshi / market-price features — confirmed\n")
+
+    if args.predict_all:
+        start = date.fromisoformat(args.start)
+        preds = walk_forward_predict(df, feats, start, args.rounds)
+        out = args.out or "data/win_prob_predictions_all.csv"
+        preds.select(
+            ["match_id", "match_date", "team_a", "team_b", "tier", "bo", "prob_team_a", "y"]
+        ).write_csv(out)
+        print(f"walk-forward predictions: {preds.height} matches from {start} -> {out}")
+        return
 
     model, X_te, y_te, test = _fit_predict(df, feats, args.rounds)
     p = model.predict(X_te, num_iteration=model.best_iteration)

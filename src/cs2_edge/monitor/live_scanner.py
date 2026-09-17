@@ -166,7 +166,8 @@ class LiveScanner:
 
         return {
             "contract_id": m["ticker"],
-            "team": kyes,
+            "team": y,
+            "opponent": b if y == a else a,
             "open_price": price,
             "model_prob": model_prob,
             "divergence": divergence,
@@ -196,7 +197,9 @@ class LiveScanner:
         if not self.webhook_url:
             return
         msg = (
-            f"**OVER signal** {s['team']}\n"
+            f"🚨 OVER signal\n"
+            f"Match: {s['team']} vs {s['opponent']}\n"
+            f"BUY NO on: {s['team']}\n"
             f"open_price: {s['open_price']:.2f} | model: {s['model_prob']:.2f} | "
             f"divergence: {s['divergence']:+.3f}\n"
             f"tier: {s['tier']} | match date: {s['match_date']}\n"

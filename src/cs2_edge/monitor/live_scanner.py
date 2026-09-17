@@ -11,8 +11,7 @@ import argparse
 import asyncio
 import os
 import re
-from collections import defaultdict
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -20,6 +19,7 @@ import numpy as np
 import polars as pl
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+from cs2_edge.collectors.hltv import HLTVCollector
 from cs2_edge.collectors.kalshi import (
     BASE_URL,
     DEFAULT_SERIES,
@@ -29,11 +29,16 @@ from cs2_edge.collectors.kalshi import (
 from cs2_edge.db.db_init import DEFAULT_DB_PATH, init_db
 from cs2_edge.models.win_probability import (
     _feature_frame,
+    _team_results,
+    backfill_tier,
     build_state,
     compute_features,
     feature_vector,
     infer_bo,
     infer_tier,
+    load_match_maps,
+    load_player_rating,
+    load_roster,
     train_model,
 )
 
@@ -90,11 +95,14 @@ class LiveScanner:
         self.model = None
         self.feats: list[str] = []
         self.state = None
-        self.roster: dict[str, list[date]] = {}
+        self.roster: dict = {}
+        self.player_rating: dict = {}
+        self.team_results: dict = {}
         self.hltv_norm: dict[str, str] = {}
 
     def _load_history(self) -> None:
         con = init_db(self.db_path)
+        backfill_tier(con)
         matches = con.execute(
             "SELECT match_id, match_date, team_a, team_b, winner, best_of, tier "
             "FROM match_results WHERE winner IS NOT NULL ORDER BY match_date"
@@ -108,28 +116,28 @@ class LiveScanner:
                 "SELECT match_id, team, AVG(rating) FROM player_ratings GROUP BY match_id, team"
             ).fetchall()
         }
-        roster: dict[str, list[date]] = defaultdict(list)
-        for ft, tt, cd in con.execute(
-            "SELECT from_team, to_team, change_date FROM roster_changes"
-        ).fetchall():
-            if ft:
-                roster[ft].append(cd)
-            if tt:
-                roster[tt].append(cd)
-        for k in roster:
-            roster[k].sort()
+        roster = load_roster(con)
+        player_rating = load_player_rating(con)
+        match_maps = load_match_maps(con)
         names = con.execute(
             "SELECT DISTINCT team_a FROM match_results UNION SELECT DISTINCT team_b FROM match_results"
         ).fetchall()
-        con.close()
 
         self.hltv_norm = {normalize_team(t[0]): t[0] for t in names}
-        df = compute_features(matches, team_rating, roster)
+        df = compute_features(matches, team_rating, roster, player_rating, match_maps)
         self.feats, df = _feature_frame(df)
         self.model = train_model(df, self.feats)
-        self.state = build_state(matches, team_rating, roster)
+        self.state = build_state(matches, team_rating, roster, match_maps)
         self.roster = roster
-        print(f"model trained ({len(self.feats)} features)")
+        self.player_rating = player_rating
+        self.team_results = _team_results(matches)
+        n_ratings = con.execute("SELECT count(*) FROM player_ratings").fetchone()[0]
+        con.execute(
+            "INSERT INTO model_training_log (n_matches, n_ratings) VALUES (?, ?)",
+            [len(matches), n_ratings],
+        )
+        con.close()
+        print(f"model trained ({len(self.feats)} features, {len(matches)} matches); retrain logged")
 
     @staticmethod
     def _mid(m: dict) -> float | None:
@@ -157,7 +165,9 @@ class LiveScanner:
 
         tier = infer_tier(_event_name(m.get("rules_primary") or ""))
         bo = _infer_bo(m.get("rules_primary") or "")
-        vec = feature_vector(a, b, md, bo, tier, self.state, self.roster, self.feats)
+        vec = feature_vector(
+            a, b, md, bo, tier, self.state, self.roster, self.player_rating, self.team_results, self.feats
+        )
         p_a = float(self.model.predict(np.array([vec], dtype=np.float32), num_iteration=self.model.best_iteration)[0])
         model_prob = p_a if y == a else (1 - p_a)
         divergence = price - model_prob
@@ -234,6 +244,15 @@ class LiveScanner:
             f"{len(signals)} signals, {len(new)} new alerts"
         )
 
+    async def _daily_update(self) -> None:
+        collector = HLTVCollector(db_path=self.db_path)
+        result = await collector.collect(days=7)
+        self._load_history()
+        print(
+            f"{datetime.now():%Y-%m-%d %H:%M:%S} daily HLTV update: "
+            f"{result['matches']} new matches, {result['ratings']} new ratings; model retrained"
+        )
+
     async def run(self, once: bool = False) -> None:
         self._load_history()
         await self._run_once()
@@ -241,8 +260,9 @@ class LiveScanner:
             return
         scheduler = AsyncIOScheduler()
         scheduler.add_job(self._run_once, "interval", hours=1, id="scan")
+        scheduler.add_job(self._daily_update, "interval", hours=24, id="hltv_update")
         scheduler.start()
-        print("live scanner running (hourly scan)")
+        print("live scanner running (hourly scan + daily HLTV update)")
         await asyncio.Event().wait()
 
 

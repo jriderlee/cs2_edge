@@ -13,6 +13,7 @@ import re
 import unicodedata
 from datetime import date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import duckdb
 import httpx
@@ -24,6 +25,12 @@ BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 DEFAULT_SERIES = ["KXCS2GAME", "KXCSGOGAME"]
 USER_AGENT = "cs2-edge/0.1"
 
+ET = ZoneInfo("America/New_York")
+_MONTHS = {
+    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+}
+
 CONTRACT_SCHEMA = {
     "contract_id": pl.Utf8,
     "match_id": pl.Int64,
@@ -32,6 +39,7 @@ CONTRACT_SCHEMA = {
     "close_price": pl.Float64,
     "resolved": pl.Utf8,
     "resolution_date": pl.Date,
+    "match_start_ts": pl.Int64,
 }
 
 CANDLE_SCHEMA = {
@@ -52,8 +60,55 @@ ALIASES = {
 GENERIC_TOKENS = {"esports", "esport", "team", "gaming"}
 
 _DATE_RE = re.compile(r"scheduled for\s+([A-Z][a-z]{2}\s+\d{1,2},\s+\d{4})")
+_TIME_RE = re.compile(r"at\s+(\d{1,2}):(\d{2})\s+([AP]M)")
 _VS_RE = re.compile(r"\s+vs\.?\s+(.+?)\s+(?:Counter[\s-]?Strike|CS2)?\s*match")
 _YES_TEAM_RE = re.compile(r"If\s+(.+?)\s+wins?\s+the")
+
+
+def _et_to_unix(dt: datetime) -> int:
+    return int(dt.replace(tzinfo=ET).timestamp())
+
+
+def _ticker_match_start_ts(ticker: str) -> int | None:
+    """Match start time from ticker 'KXCS2GAME-26JUL181700IMPBHE-IMP' (date+HHMM in ET)."""
+    body = ticker.split("-", 1)[1] if "-" in ticker else ticker
+    m = re.match(r"^(\d{2})([A-Z]{3})(\d{2})(\d{4})?", body)
+    if not m or not m.group(4):
+        return None
+    mon = _MONTHS.get(m.group(2))
+    if mon is None:
+        return None
+    try:
+        dt = datetime(2000 + int(m.group(1)), mon, int(m.group(3)), int(m.group(4)[:2]), int(m.group(4)[2:]))
+    except ValueError:
+        return None
+    return _et_to_unix(dt)
+
+
+def _rules_match_start_ts(rules_primary: str) -> int | None:
+    d = _DATE_RE.search(rules_primary)
+    t = _TIME_RE.search(rules_primary)
+    if not d or not t:
+        return None
+    try:
+        day = datetime.strptime(d.group(1), "%b %d, %Y")
+    except ValueError:
+        return None
+    hh = int(t.group(1))
+    mm = int(t.group(2))
+    if t.group(3) == "PM" and hh != 12:
+        hh += 12
+    elif t.group(3) == "AM" and hh == 12:
+        hh = 0
+    try:
+        return _et_to_unix(datetime(day.year, day.month, day.day, hh, mm))
+    except ValueError:
+        return None
+
+
+def parse_match_start_ts(ticker: str, rules_primary: str) -> int | None:
+    """Match start time (unix, UTC). Ticker wins; rules text is the fallback."""
+    return _ticker_match_start_ts(ticker) or _rules_match_start_ts(rules_primary or "")
 
 
 def _fold(name: str) -> str:
@@ -244,6 +299,8 @@ class KalshiCollector:
         if "open_price" not in contract_cols:
             con.execute("DROP TABLE IF EXISTS kalshi_contracts")
             con.execute(SCHEMA_PATH.read_text())
+        elif "match_start_ts" not in contract_cols:
+            con.execute("ALTER TABLE kalshi_contracts ADD COLUMN match_start_ts BIGINT")
         candle_cols = {r[0] for r in con.execute("DESCRIBE kalshi_candles").fetchall()}
         if "volume" not in candle_cols:
             con.execute("DROP TABLE IF EXISTS kalshi_candles")
@@ -262,7 +319,8 @@ class KalshiCollector:
             "open_price = COALESCE(EXCLUDED.open_price, kalshi_contracts.open_price), "
             "close_price = EXCLUDED.close_price, "
             "resolved = EXCLUDED.resolved, "
-            "resolution_date = EXCLUDED.resolution_date"
+            "resolution_date = EXCLUDED.resolution_date, "
+            "match_start_ts = COALESCE(EXCLUDED.match_start_ts, kalshi_contracts.match_start_ts)"
         )
         return df.height
 
@@ -334,6 +392,7 @@ class KalshiCollector:
                         "close_price": close_price,
                         "resolved": resolved,
                         "resolution_date": self._to_date(res_ts),
+                        "match_start_ts": parse_match_start_ts(m["ticker"], m.get("rules_primary") or ""),
                     }
                 )
 
@@ -467,6 +526,14 @@ def _selftest() -> None:
     assert _first_open(live_candles) == 0.66
     hist_candles = [{"price": {"open": "0.6800", "close": "0.7100"}}]
     assert _first_open(hist_candles) == 0.68
+
+    # match start time: ticker wins, rules text fallback
+    assert parse_match_start_ts("KXCS2GAME-26JUL181700IMPBHE-IMP", "") == _et_to_unix(datetime(2026, 7, 18, 17, 0))
+    assert parse_match_start_ts(
+        "KXCS2GAME-25NOV29IMPNAVI-NAVI",
+        "If Natus Vincere wins the ... scheduled for Nov 29, 2025 at 5:00 PM EDT, then ...",
+    ) == _et_to_unix(datetime(2025, 11, 29, 17, 0))
+    assert parse_match_start_ts("KXCS2GAME-25NOV29IMPNAVI-NAVI", "scheduled for Nov 29, 2025, then") is None
 
     print("selftest OK")
 

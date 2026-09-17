@@ -1,8 +1,8 @@
 """Backtester for the overpriced-favorite short strategy.
 
-For each flagged contract: buy 100 NO contracts at the NO price (1 - open_price),
-pay the maker fee at entry, hold to resolution. NO wins when the team loses.
-Flat position sizing only.
+For each flagged contract: deploy a flat $5 position in NO contracts
+(contracts = floor($5 / NO price)), pay the maker fee, hold to resolution.
+NO wins when the team loses.
 """
 
 from __future__ import annotations
@@ -18,21 +18,22 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import polars as pl
 
-from cs2_edge.analysis.divergence_scorer import FLAG_MIN_DIVERGENCE, flags, score
+from cs2_edge.analysis.divergence_scorer import FLAG_MIN_DIVERGENCE, flags, load_contracts, score
 from cs2_edge.db.db_init import DEFAULT_DB_PATH, init_db
 
-POSITION = 100
+POSITION = 5.0
 MAKER_FEE = 0.0175
 TRADING_DAYS = 252
 
 
 def apply_pnl(flagged: pl.DataFrame) -> pl.DataFrame:
     open_p = flagged["open_price"]
-    entry = POSITION * (1.0 - open_p)
-    fee = POSITION * MAKER_FEE * open_p * (1.0 - open_p)
+    no_price = (1.0 - open_p).round(4)
+    contracts = (POSITION / no_price).floor().cast(pl.Int64)
+    fee = contracts * MAKER_FEE * open_p * no_price
     won = flagged["resolved"] == "no"
-    pnl = pl.when(won).then(POSITION - entry - fee).otherwise(-entry - fee)
-    return flagged.with_columns(entry=entry, fee=fee, pnl=pnl)
+    pnl = pl.when(won).then(contracts - POSITION - fee).otherwise(-POSITION - fee)
+    return flagged.with_columns(contracts=contracts, fee=fee, pnl=pnl)
 
 
 def divergence_bucket(divergence: pl.Expr) -> pl.Expr:
@@ -71,11 +72,7 @@ def main() -> None:
         return
 
     con = init_db(args.db)
-    contracts = con.execute(
-        "SELECT contract_id, match_id, team, open_price, resolved, resolution_date "
-        "FROM kalshi_contracts "
-        "WHERE resolved IN ('yes', 'no') AND open_price IS NOT NULL AND match_id IS NOT NULL"
-    ).pl()
+    contracts = load_contracts(con)
     con.close()
 
     predictions = pl.read_csv(args.pred)
@@ -90,6 +87,7 @@ def main() -> None:
     total_pnl = float(flagged["pnl"].sum())
     win_rate = float((flagged["resolved"] == "no").mean())
     avg_pnl = float(flagged["pnl"].mean())
+    capital_deployed = n * POSITION
 
     daily = flagged.group_by("resolution_date").agg(pl.col("pnl").sum()).sort("resolution_date")
     cum = flagged["pnl"].cum_sum()
@@ -101,6 +99,7 @@ def main() -> None:
     print(f"avg PnL/trade: ${avg_pnl:,.2f}")
     print(f"Sharpe (daily): {sharpe(daily['pnl']):.2f}")
     print(f"max drawdown: ${max_drawdown(cum):,.2f}")
+    print(f"total capital deployed: ${capital_deployed:,.2f}")
 
     print("\n=== by tier ===")
     print(f"{'tier':<5}{'n':>5}{'pnl':>12}{'win%':>7}{'avg/trade':>11}")
@@ -141,7 +140,7 @@ def main() -> None:
     ax.axhline(0, color="k", lw=0.8)
     ax.set_xlabel("resolution date")
     ax.set_ylabel("PnL ($)")
-    ax.set_title("Backtest equity curve (flat 100 NO contracts)")
+    ax.set_title("Backtest equity curve (flat $5 NO position)")
     fig.tight_layout()
     fig.savefig(args.plot, dpi=150)
     plt.close(fig)
@@ -166,16 +165,17 @@ def _selftest() -> None:
     out = apply_pnl(flagged)
 
     c1 = out.filter(pl.col("contract_id") == "c1").row(0, named=True)
-    entry1 = 100 * (1 - 0.95)  # 5.0
-    fee1 = 100 * 0.0175 * 0.95 * 0.05  # 0.083125
-    assert abs(c1["entry"] - entry1) < 1e-9, c1
+    contracts1 = 100  # floor(5 / 0.05)
+    fee1 = contracts1 * 0.0175 * 0.95 * 0.05
+    assert c1["contracts"] == contracts1, c1
     assert abs(c1["fee"] - fee1) < 1e-9, c1
-    assert abs(c1["pnl"] - (100 - entry1 - fee1)) < 1e-9, c1
+    assert abs(c1["pnl"] - (contracts1 - 5.0 - fee1)) < 1e-9, c1
 
     c2 = out.filter(pl.col("contract_id") == "c2").row(0, named=True)
-    entry2 = 100 * (1 - 0.90)  # 10.0
-    fee2 = 100 * 0.0175 * 0.90 * 0.10  # 0.1575
-    assert abs(c2["pnl"] - (-entry2 - fee2)) < 1e-9, c2
+    contracts2 = 50  # floor(5 / 0.10)
+    fee2 = contracts2 * 0.0175 * 0.90 * 0.10
+    assert c2["contracts"] == contracts2, c2
+    assert abs(c2["pnl"] - (-5.0 - fee2)) < 1e-9, c2
 
     buckets = out.with_columns(b=divergence_bucket(pl.col("divergence")))
     assert buckets.filter(pl.col("contract_id") == "c1")["b"][0] == "0.20-0.30"

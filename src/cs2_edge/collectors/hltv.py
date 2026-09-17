@@ -52,9 +52,23 @@ ROSTER_SCHEMA = {
     "change_type": pl.Utf8,
     "source_url": pl.Utf8,
 }
+MAP_SCHEMA = {
+    "match_id": pl.Int64,
+    "map_name": pl.Utf8,
+    "winner": pl.Utf8,
+}
+MAP_STATS_SCHEMA = {
+    "team": pl.Utf8,
+    "map_name": pl.Utf8,
+    "wins": pl.Int64,
+    "losses": pl.Int64,
+    "win_rate": pl.Float64,
+    "date": pl.Date,
+}
 MATCH_KEY_COLS = ["match_id", "match_date", "team_a", "team_b", "winner", "best_of", "map_count"]
 RATING_KEY_COLS = ["player_id", "match_id", "player_name", "team", "rating_date", "rating", "maps_played"]
 ROSTER_KEY_COLS = ["change_id"]
+MAP_KEY_COLS = ["match_id", "map_name"]
 
 
 def parse_hltv_date(text: str | None) -> date | None:
@@ -170,6 +184,29 @@ def parse_match_stats(page: BeautifulSoup) -> list[dict]:
     return rows
 
 
+def parse_match_maps(page: BeautifulSoup) -> list[dict]:
+    """Extract per-map winners from a match page's map list."""
+    rows: list[dict] = []
+    for holder in page.select(".mapholder"):
+        if not holder.select_one(".played"):
+            continue  # skip banned / unplayed maps
+        map_el = holder.select_one(".mapname")
+        if not map_el:
+            continue
+        map_name = map_el.get_text(strip=True)
+        left = holder.select_one(".results-left")
+        right = holder.select_one(".results-right")
+        winner = None
+        for side in (left, right):
+            if side and "won" in (side.get("class") or []):
+                name_el = side.select_one(".results-teamname")
+                winner = name_el.get_text(strip=True) if name_el else None
+                break
+        if winner:
+            rows.append({"match_id": None, "map_name": map_name, "winner": winner})
+    return rows
+
+
 def _change_id(player_id: int, change_date: date, ctype: str, from_team: str | None, to_team: str | None) -> int:
     key = f"{player_id}|{change_date}|{ctype}|{from_team or ''}|{to_team or ''}"
     return int(hashlib.md5(key.encode()).hexdigest()[:15], 16)
@@ -257,8 +294,8 @@ class HLTVCollector:
         con.execute(f"INSERT INTO {table} BY NAME SELECT * FROM _df")
         return df.height
 
-    async def collect(self, years: int = 2, max_matches: int | None = None) -> dict:
-        start_date = date.today() - timedelta(days=365 * years)
+    async def collect(self, years: int = 2, days: int | None = None, max_matches: int | None = None) -> dict:
+        start_date = date.today() - timedelta(days=(days if days is not None else 365 * years))
         self.hltv = Hltv(
             min_delay=1.0,
             max_delay=self.delay + 1.0,
@@ -289,6 +326,7 @@ class HLTVCollector:
 
                 match_rows: list[dict] = []
                 rating_rows: list[dict] = []
+                map_rows: list[dict] = []
                 for m in new:
                     if max_matches and len(match_rows) >= max_matches:
                         break
@@ -302,19 +340,23 @@ class HLTVCollector:
                             r["rating_date"] = m["match_date"]
                             r["maps_played"] = m["map_count"]
                             rating_rows.append(r)
+                        for mm in parse_match_maps(stats_page):
+                            mm["match_id"] = m["match_id"]
+                            map_rows.append(mm)
                     match_rows.append(m)
                     existing.add(m["match_id"])
 
                 n_matches = self._insert(con, "match_results", match_rows, MATCH_SCHEMA, MATCH_KEY_COLS)
                 n_ratings = self._insert(con, "player_ratings", rating_rows, RATING_SCHEMA, RATING_KEY_COLS)
+                n_maps = self._insert(con, "match_maps", map_rows, MAP_SCHEMA, MAP_KEY_COLS)
                 total_matches += n_matches
                 total_ratings += n_ratings
                 counts = con.execute(
                     "SELECT (SELECT count(*) FROM match_results), (SELECT count(*) FROM player_ratings)"
                 ).fetchone()
                 print(
-                    f"offset={offset}: inserted {n_matches} matches, {n_ratings} ratings "
-                    f"(totals: {counts[0]} matches, {counts[1]} ratings)"
+                    f"offset={offset}: inserted {n_matches} matches, {n_ratings} ratings, "
+                    f"{n_maps} maps (totals: {counts[0]} matches, {counts[1]} ratings)"
                 )
 
                 if matches[-1]["match_date"] < start_date:
@@ -355,6 +397,80 @@ class HLTVCollector:
         print(f"roster changes inserted: {n}")
         return n
 
+    async def collect_map_stats(self, years: int = 2, max_matches: int | None = None) -> dict:
+        """Backfill per-map winners from match pages, then aggregate into map_stats."""
+        start_date = date.today() - timedelta(days=365 * years)
+        self.hltv = Hltv(min_delay=1.0, max_delay=self.delay + 1.0, timeout=self.timeout, max_retries=self.max_retries)
+        con = init_db(self.db_path)
+        have = {r[0] for r in con.execute("SELECT DISTINCT match_id FROM match_maps").fetchall()}
+        pending = [
+            r for r in con.execute(
+                "SELECT match_id, hltv_url FROM match_results WHERE match_date >= ? ORDER BY match_date",
+                [start_date],
+            ).fetchall()
+            if r[0] not in have
+        ]
+        if max_matches:
+            pending = pending[:max_matches]
+
+        rows: list[dict] = []
+        fetched = 0
+        try:
+            for mid, url in pending:
+                page = await self.hltv._fetch(url)
+                if page is not None:
+                    for mm in parse_match_maps(page):
+                        mm["match_id"] = mid
+                        rows.append(mm)
+                fetched += 1
+                if fetched % 25 == 0:
+                    self._insert(con, "match_maps", rows, MAP_SCHEMA, MAP_KEY_COLS)
+                    rows = []
+                    print(f"map backfill: {fetched}/{len(pending)}")
+                await asyncio.sleep(self.delay)
+        finally:
+            if rows:
+                self._insert(con, "match_maps", rows, MAP_SCHEMA, MAP_KEY_COLS)
+            await self.hltv.close()
+
+        self._build_map_stats(con, start_date)
+        total = con.execute("SELECT count(*) FROM map_stats").fetchone()[0]
+        con.close()
+        print(f"map backfill done: {fetched} matches; map_stats rows: {total}")
+        return {"matches": fetched, "map_stats": total}
+
+    def _build_map_stats(self, con: duckdb.DuckDBPyConnection, start_date: date) -> None:
+        df = con.execute(
+            "SELECT mm.match_id, mm.map_name, mm.winner, mr.team_a, mr.team_b "
+            "FROM match_maps mm JOIN match_results mr USING (match_id) "
+            "WHERE mr.match_date >= ?",
+            [start_date],
+        ).pl()
+        if df.height == 0:
+            return
+        wins = df.select(team=pl.col("winner"), map_name=pl.col("map_name")).with_columns(result=pl.lit(1))
+        losses = df.with_columns(
+            team=pl.when(pl.col("winner") == pl.col("team_a")).then(pl.col("team_b")).otherwise(pl.col("team_a"))
+        ).select(team=pl.col("team"), map_name=pl.col("map_name")).with_columns(result=pl.lit(0))
+        agg = (
+            pl.concat([wins, losses])
+            .group_by(["team", "map_name"])
+            .agg(
+                wins=pl.col("result").sum(),
+                losses=(1 - pl.col("result")).sum(),
+            )
+            .with_columns(
+                win_rate=pl.col("wins") / (pl.col("wins") + pl.col("losses")),
+                date=pl.lit(date.today()),
+            )
+        )
+        con.register("_ms", agg)
+        con.execute(
+            "INSERT INTO map_stats BY NAME SELECT * FROM _ms "
+            "ON CONFLICT (team, map_name, date) DO UPDATE SET "
+            "wins = EXCLUDED.wins, losses = EXCLUDED.losses, win_rate = EXCLUDED.win_rate"
+        )
+
 
 async def _run(args: argparse.Namespace) -> None:
     collector = HLTVCollector(
@@ -370,6 +486,14 @@ async def _run_roster(args: argparse.Namespace) -> None:
     print(f"Done: {n} roster changes")
 
 
+async def _run_maps(args: argparse.Namespace) -> None:
+    collector = HLTVCollector(
+        db_path=args.db, delay=args.delay, timeout=args.timeout, max_retries=args.retries
+    )
+    result = await collector.collect_map_stats(years=args.years, max_matches=args.limit)
+    print(f"Done: {result['matches']} matches backfilled, {result['map_stats']} map_stats rows")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Collect CS2 match results from HLTV.org")
     parser.add_argument("--db", default=str(DEFAULT_DB_PATH), help="Path to DuckDB file")
@@ -379,6 +503,7 @@ def main() -> None:
     parser.add_argument("--retries", type=int, default=10, help="Max retries per request")
     parser.add_argument("--limit", type=int, default=None, help="Max matches to collect (testing)")
     parser.add_argument("--roster", action="store_true", help="Scrape roster changes (transfers)")
+    parser.add_argument("--maps", action="store_true", help="Backfill per-map results and build map_stats")
     parser.add_argument("--pages", type=int, default=90, help="Transfers pages to scrape (~1 year)")
     parser.add_argument("--selftest", action="store_true", help="Run parser self-check and exit")
     args = parser.parse_args()
@@ -389,6 +514,10 @@ def main() -> None:
 
     if args.roster:
         asyncio.run(_run_roster(args))
+        return
+
+    if args.maps:
+        asyncio.run(_run_maps(args))
         return
 
     asyncio.run(_run(args))
@@ -462,6 +591,26 @@ def _selftest() -> None:
     assert t["player_id"] == 25111 and t["player_name"] == "redzed", t
     assert t["from_team"] == "Aurora Young Blud" and t["to_team"] == "Bebop", t
     assert t["change_type"] == "transfer" and t["change_date"] == date(2026, 9, 17), t
+
+    maps_html = """
+    <div class="mapholder">
+      <div class="played"><div class="mapname">Nuke</div></div>
+      <div class="results played">
+        <div class="results-left lost"><div class="results-teamname">NiP</div></div>
+        <div class="results-right won"><div class="results-teamname">FaZe</div></div>
+      </div>
+    </div>
+    <div class="mapholder">
+      <div class="optional"><div class="mapname">Cache</div></div>
+      <div class="results optional">
+        <div class="results-left tie"><div class="results-teamname">NiP</div></div>
+        <div class="results-right tie"><div class="results-teamname">FaZe</div></div>
+      </div>
+    </div>
+    """
+    maps = parse_match_maps(BeautifulSoup(maps_html, "html.parser"))
+    assert len(maps) == 1, maps
+    assert maps[0]["map_name"] == "Nuke" and maps[0]["winner"] == "FaZe", maps
 
     print("selftest OK")
 

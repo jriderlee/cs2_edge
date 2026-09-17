@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS kalshi_contracts (
     open_price      DOUBLE,
     close_price     DOUBLE,
     resolved        VARCHAR,
-    resolution_date DATE
+    resolution_date DATE,
+    match_start_ts  BIGINT
 );
 
 CREATE TABLE IF NOT EXISTS kalshi_candles (
@@ -48,6 +49,23 @@ CREATE TABLE IF NOT EXISTS kalshi_candles (
     price           DOUBLE,
     volume          DOUBLE,
     PRIMARY KEY (contract_id, end_period_ts)
+);
+
+CREATE TABLE IF NOT EXISTS match_maps (
+    match_id        BIGINT,
+    map_name        VARCHAR,
+    winner          VARCHAR,
+    PRIMARY KEY (match_id, map_name)
+);
+
+CREATE TABLE IF NOT EXISTS map_stats (
+    team            VARCHAR,
+    map_name        VARCHAR,
+    wins            BIGINT,
+    losses          BIGINT,
+    win_rate        DOUBLE,
+    date            DATE,
+    PRIMARY KEY (team, map_name, date)
 );
 
 CREATE TABLE IF NOT EXISTS roster_changes (
@@ -60,6 +78,12 @@ CREATE TABLE IF NOT EXISTS roster_changes (
     change_type     VARCHAR,
     source_url      VARCHAR,
     ingested_at     TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS model_training_log (
+    retrained_at    TIMESTAMPTZ DEFAULT now(),
+    n_matches       INTEGER,
+    n_ratings       INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS live_alerts (

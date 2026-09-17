@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import os
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -23,6 +24,8 @@ from cs2_edge.collectors.hltv import HLTVCollector
 from cs2_edge.collectors.kalshi import (
     BASE_URL,
     DEFAULT_SERIES,
+    _RateLimiter,
+    parse_match_start_ts,
     parse_rules_primary,
     normalize_team,
 )
@@ -44,6 +47,8 @@ from cs2_edge.models.win_probability import (
 
 MIN_PRICE = 0.90
 MIN_DIVERGENCE = 0.30
+MAX_PRICE_MOVE = 0.15        # drop if current price moved >0.15 from open
+MIN_RECENT_VOLUME = 1.0      # drop if last-2-candle volume is below this ("near zero")
 USER_AGENT = "cs2-edge/0.1"
 
 
@@ -68,6 +73,15 @@ def _to_float(v: str | float | None) -> float | None:
         return None
 
 
+def _to_unix(ts: str | None) -> int | None:
+    if not ts:
+        return None
+    try:
+        return int(datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp())
+    except ValueError:
+        return None
+
+
 def _event_name(rules: str) -> str:
     m = re.search(r"wins the (.+?):", rules)
     return m.group(1).strip() if m else ""
@@ -80,6 +94,30 @@ def _infer_bo(rules: str) -> str:
     if "best of one" in r or "bo1" in r:
         return "BO1"
     return "BO3"  # Kalshi CS2 is predominantly BO3
+
+
+def _candle_volume(c: dict) -> float | None:
+    v = c.get("volume_fp")
+    if v is None:
+        v = c.get("volume")
+    return _to_float(v)
+
+
+def _first_candle_mid(c: dict) -> float | None:
+    """Representative YES price of a candle: mid of bid/ask open (live) or flat open (hist)."""
+    ask = _to_float((c.get("yes_ask") or {}).get("open_dollars")) if isinstance(c.get("yes_ask"), dict) else None
+    bid = _to_float((c.get("yes_bid") or {}).get("open_dollars")) if isinstance(c.get("yes_bid"), dict) else None
+    if ask is not None and bid is not None and bid > 0:
+        return (ask + bid) / 2
+    if ask is not None:
+        return ask
+    if bid is not None:
+        return bid
+    p = c.get("price") or {}
+    if isinstance(p, dict):
+        v = p.get("open_dollars") if "open_dollars" in p else p.get("open")
+        return _to_float(v)
+    return None
 
 
 class LiveScanner:
@@ -197,11 +235,53 @@ class LiveScanner:
                 resp = await client.get("/markets", params=params)
                 resp.raise_for_status()
                 data = resp.json()
-                markets.extend(m for m in data.get("markets", []) if m.get("status") == "active")
+                for m in data.get("markets", []):
+                    if m.get("status") == "active":
+                        m["_series"] = st
+                        markets.append(m)
                 cursor = data.get("cursor") or ""
                 if not cursor:
                     break
         return markets
+
+    async def _fetch_candles(self, client: httpx.AsyncClient, markets: list[dict]) -> dict[str, list[dict]]:
+        """Fetch candle history for each market (concurrent, rate-limited)."""
+        sem = asyncio.Semaphore(8)
+        limiter = _RateLimiter(5.0)
+        now = int(time.time())
+
+        async def one(m: dict) -> tuple[str, list[dict]]:
+            async with sem:
+                await limiter.wait()
+                st = m.get("_series") or self.series[0]
+                start = _to_unix(m.get("open_time")) or (now - 7 * 86400)
+                try:
+                    resp = await client.get(
+                        f"/series/{st}/markets/{m['ticker']}/candlesticks",
+                        params={"start_ts": start - 3600, "end_ts": now + 3600, "period_interval": 60},
+                    )
+                    resp.raise_for_status()
+                    return m["ticker"], resp.json().get("candlesticks", [])
+                except httpx.HTTPError:
+                    return m["ticker"], []
+
+        results = await asyncio.gather(*(one(m) for m in markets))
+        return dict(results)
+
+    @staticmethod
+    def _mature_reason(m: dict, candles: list[dict]) -> str | None:
+        """Return the reason a market should be dropped, or None if it is fresh."""
+        cs = sorted(candles, key=lambda c: c.get("end_period_ts") or 0)
+        if not cs:
+            return "no-candles"
+        recent_vol = sum(_candle_volume(c) or 0.0 for c in cs[-2:])
+        if recent_vol < MIN_RECENT_VOLUME:
+            return "volume"
+        open_price = _first_candle_mid(cs[0])
+        current = LiveScanner._mid(m)
+        if open_price is not None and current is not None and abs(current - open_price) > MAX_PRICE_MOVE:
+            return "moved"
+        return None
 
     async def _post_discord(self, s: dict) -> None:
         if not self.webhook_url:
@@ -222,12 +302,33 @@ class LiveScanner:
             print(f"discord post failed: {e}")
 
     async def _run_once(self) -> None:
+        now = int(time.time())
         async with httpx.AsyncClient(
             base_url=BASE_URL, timeout=30, headers={"User-Agent": USER_AGENT}
         ) as client:
             markets = await self._fetch_active_markets(client)
+            total = len(markets)
 
-        signals = [s for m in markets if (s := self._score(m))]
+            # CHANGE 1: pre-match filter — keep only markets that haven't started
+            prematch: list[dict] = []
+            for m in markets:
+                mts = parse_match_start_ts(m.get("ticker") or "", m.get("rules_primary") or "")
+                if mts is not None and now < mts:
+                    m["_match_start_ts"] = mts
+                    prematch.append(m)
+
+            # CHANGE 2: mature market filter — needs candle data
+            candles = await self._fetch_candles(client, prematch)
+            fresh: list[dict] = []
+            drop_reasons: dict[str, int] = {}
+            for m in prematch:
+                reason = self._mature_reason(m, candles.get(m["ticker"], []))
+                if reason is None:
+                    fresh.append(m)
+                else:
+                    drop_reasons[reason] = drop_reasons.get(reason, 0) + 1
+
+        signals = [s for m in fresh if (s := self._score(m))]
         con = init_db(self.db_path)
         existing = {r[0] for r in con.execute("SELECT contract_id FROM live_alerts").fetchall()}
         new = [s for s in signals if s["contract_id"] not in existing]
@@ -239,9 +340,11 @@ class LiveScanner:
                 [s["contract_id"], s["team"], s["open_price"], s["model_prob"], s["divergence"], s["tier"], s["event_ticker"], s["match_date"]],
             )
         con.close()
+        reasons = " ".join(f"{k}={v}" for k, v in sorted(drop_reasons.items())) or "-"
         print(
-            f"{datetime.now():%Y-%m-%d %H:%M:%S} scan: {len(markets)} active markets, "
-            f"{len(signals)} signals, {len(new)} new alerts"
+            f"{datetime.now():%Y-%m-%d %H:%M:%S} scan: {total} markets -> "
+            f"{len(prematch)} pre-match -> {len(fresh)} not-mature -> {len(signals)} signals "
+            f"({len(new)} new alerts; mature drops: {reasons})"
         )
 
     async def _daily_update(self) -> None:

@@ -10,11 +10,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "cs2_edge.duckdb"
 
 
-def init_db(db_path: str | Path = DEFAULT_DB_PATH) -> duckdb.DuckDBPyConnection:
+def init_db(db_path: str | Path = DEFAULT_DB_PATH, read_only: bool = False) -> duckdb.DuckDBPyConnection:
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    con = duckdb.connect(str(db_path))
-    con.execute(SCHEMA_PATH.read_text())
+    con = duckdb.connect(str(db_path), read_only=read_only)
+    if not read_only:
+        con.execute(SCHEMA_PATH.read_text())
     return con
 
 

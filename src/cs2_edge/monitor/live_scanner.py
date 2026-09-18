@@ -15,6 +15,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import duckdb
 import httpx
 import numpy as np
 import polars as pl
@@ -33,7 +34,6 @@ from cs2_edge.db.db_init import DEFAULT_DB_PATH, init_db
 from cs2_edge.models.win_probability import (
     _feature_frame,
     _team_results,
-    backfill_tier,
     build_state,
     compute_features,
     feature_vector,
@@ -50,6 +50,25 @@ MIN_DIVERGENCE = 0.30
 MAX_PRICE_MOVE = 0.15        # drop if current price moved >0.15 from open
 MIN_RECENT_VOLUME = 1.0      # drop if last-2-candle volume is below this ("near zero")
 USER_AGENT = "cs2-edge/0.1"
+
+
+def write_with_retry(
+    db_path: Path, sql: str, params: list, retries: int = 5, delay: float = 0.5
+) -> None:
+    """Run a single INSERT on a short-lived writable connection, retrying on lock
+    collisions with the background collector. Closes immediately after the write."""
+    for attempt in range(1, retries + 1):
+        try:
+            con = duckdb.connect(str(db_path))
+            try:
+                con.execute(sql, params)
+                return
+            finally:
+                con.close()
+        except duckdb.IOException:
+            if attempt == retries:
+                raise
+            time.sleep(delay)
 
 
 def load_env(path: str = ".env") -> None:
@@ -139,8 +158,7 @@ class LiveScanner:
         self.hltv_norm: dict[str, str] = {}
 
     def _load_history(self) -> None:
-        con = init_db(self.db_path)
-        backfill_tier(con)
+        con = init_db(self.db_path, read_only=True)
         matches = con.execute(
             "SELECT match_id, match_date, team_a, team_b, winner, best_of, tier "
             "FROM match_results WHERE winner IS NOT NULL ORDER BY match_date"
@@ -170,11 +188,12 @@ class LiveScanner:
         self.player_rating = player_rating
         self.team_results = _team_results(matches)
         n_ratings = con.execute("SELECT count(*) FROM player_ratings").fetchone()[0]
-        con.execute(
+        con.close()
+        write_with_retry(
+            self.db_path,
             "INSERT INTO model_training_log (n_matches, n_ratings) VALUES (?, ?)",
             [len(matches), n_ratings],
         )
-        con.close()
         print(f"model trained ({len(self.feats)} features, {len(matches)} matches); retrain logged")
 
     @staticmethod
@@ -329,12 +348,13 @@ class LiveScanner:
                     drop_reasons[reason] = drop_reasons.get(reason, 0) + 1
 
         signals = [s for m in fresh if (s := self._score(m))]
-        con = init_db(self.db_path)
+        con = init_db(self.db_path, read_only=True)
         existing = {r[0] for r in con.execute("SELECT contract_id FROM live_alerts").fetchall()}
         new = [s for s in signals if s["contract_id"] not in existing]
         for s in new:
             await self._post_discord(s)
-            con.execute(
+            write_with_retry(
+                self.db_path,
                 "INSERT INTO live_alerts (contract_id, team, open_price, model_prob, divergence, tier, event_ticker, match_date) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 [s["contract_id"], s["team"], s["open_price"], s["model_prob"], s["divergence"], s["tier"], s["event_ticker"], s["match_date"]],

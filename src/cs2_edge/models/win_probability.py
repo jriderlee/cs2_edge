@@ -49,20 +49,6 @@ def infer_bo(best_of: int) -> str:
     return "BO1"  # best_of 1 (walkover) or >5 (BO1 round scores)
 
 
-def backfill_tier(con) -> int:
-    """Add match_results.tier and populate it from event_name (idempotent)."""
-    con.execute("ALTER TABLE match_results ADD COLUMN IF NOT EXISTS tier VARCHAR")
-    df = con.execute("SELECT match_id, event_name FROM match_results").pl().with_columns(
-        tier=pl.col("event_name").map_elements(infer_tier, return_dtype=pl.Utf8)
-    )
-    con.register("_tierdf", df)
-    con.execute(
-        "UPDATE match_results SET tier = _tierdf.tier "
-        "FROM _tierdf WHERE match_results.match_id = _tierdf.match_id"
-    )
-    return df.height
-
-
 def load_roster(con) -> dict[str, list[dict]]:
     """team -> sorted roster-change events (change_date, from_team, to_team, player_id)."""
     roster: dict[str, list[dict]] = defaultdict(list)
@@ -532,7 +518,6 @@ def main() -> None:
         return
 
     con = init_db(args.db)
-    backfill_tier(con)
     matches = con.execute(
         "SELECT match_id, match_date, team_a, team_b, winner, best_of, tier "
         "FROM match_results WHERE winner IS NOT NULL ORDER BY match_date"

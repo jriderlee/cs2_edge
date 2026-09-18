@@ -11,6 +11,9 @@ build/
 # DuckDB local data
 data/
 
+# Accidental nested repo
+/cs2_edge/
+
 # Environment
 .env
 
